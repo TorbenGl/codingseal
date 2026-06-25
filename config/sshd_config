@@ -1,0 +1,30 @@
+Port 2222
+ListenAddress 0.0.0.0
+
+# Authentication — key-only, no passwords
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+UsePAM no
+AuthorizedKeysFile .ssh/authorized_keys
+
+# Security hardening
+X11Forwarding no
+AllowTcpForwarding yes
+GatewayPorts no
+PermitTunnel no
+
+# Performance
+UseDNS no
+PrintLastLog no
+
+# Keep-alive (required for VS Code Remote-SSH to stay connected)
+ClientAliveInterval 30
+ClientAliveCountMax 3
+
+# Forward ANTHROPIC_API_KEY from SSH client via: ssh -o SendEnv=ANTHROPIC_API_KEY
+AcceptEnv ANTHROPIC_API_KEY LANG LC_*
+
+# Log to stderr so `podman logs` captures it
+SyslogFacility AUTH
+LogLevel INFO
