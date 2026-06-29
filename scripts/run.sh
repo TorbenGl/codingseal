@@ -188,6 +188,63 @@ if [[ ! -f "${CLAUDE_AUTH_DIR}/.claude.json" ]]; then
         > "${CLAUDE_AUTH_DIR}/.claude.json"
 fi
 
+# ── Register the built-in MCP servers (user scope) ─────────────────────────
+# Merge into the seeded .claude.json's top-level `mcpServers` (user scope) so
+# they load in every project and every mode (local / --rc / manual claude over
+# --ssh) with no approval prompt. Idempotent: existing keys are preserved.
+#   context7            — up-to-date library docs (stdio, baked in the image)
+#   sequential-thinking — reasoning scaffold (stdio, baked in the image)
+#   github              — remote endpoint, added ONLY when a PAT is provided
+# Optional credentials come from the environment (i.e. your .env):
+#   CONTEXT7_API_KEY                higher Context7 rate limits (works without it)
+#   GITHUB_PERSONAL_ACCESS_TOKEN    enables the GitHub MCP server (Bearer header)
+if command -v python3 >/dev/null 2>&1; then
+    CONTEXT7_API_KEY="${CONTEXT7_API_KEY:-}" \
+    GITHUB_PERSONAL_ACCESS_TOKEN="${GITHUB_PERSONAL_ACCESS_TOKEN:-}" \
+    python3 - "${CLAUDE_AUTH_DIR}/.claude.json" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+ctx_key = os.environ.get("CONTEXT7_API_KEY", "").strip()
+gh_pat  = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip()
+
+data = {}
+if os.path.exists(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+
+servers = data.setdefault("mcpServers", {})
+
+ctx_args = ["-y", "@upstash/context7-mcp"]
+if ctx_key:
+    ctx_args += ["--api-key", ctx_key]
+servers["context7"] = {"command": "npx", "args": ctx_args}
+
+servers["sequential-thinking"] = {
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+}
+
+if gh_pat:
+    servers["github"] = {
+        "type": "http",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "headers": {"Authorization": "Bearer " + gh_pat},
+    }
+else:
+    servers.pop("github", None)
+
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+else
+    echo "⚠️  python3 not found on host — skipping MCP server setup." >&2
+    echo "    Add them yourself inside the container, e.g.:" >&2
+    echo "      claude mcp add --scope user context7 -- npx -y @upstash/context7-mcp" >&2
+fi
+
 # ── Build base flags ──────────────────────────────────────────────────────
 PODMAN_FLAGS=(
     "--name"    "${CONTAINER_NAME}"

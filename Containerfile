@@ -41,6 +41,15 @@ RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
 # ── Claude Code CLI (global, world-readable — usable by any user) ──────────
 RUN npm install -g @anthropic-ai/claude-code
 
+# ── Baked-in MCP servers (stdio) ───────────────────────────────────────────
+# Installed globally so `npx -y <pkg>` resolves them offline/instantly at
+# runtime. run.sh registers these as user-scope MCP servers in ~/.claude.json:
+#   @upstash/context7-mcp                          → up-to-date library docs (Context7)
+#   @modelcontextprotocol/server-sequential-thinking → step-by-step reasoning scaffold
+# (The GitHub MCP server is remote — https://api.githubcopilot.com/mcp/ — so it
+# needs nothing baked here; run.sh adds it only when a PAT is provided.)
+RUN npm install -g @upstash/context7-mcp @modelcontextprotocol/server-sequential-thinking
+
 # ── uv + Python in SHARED locations (reachable by the non-root user) ───────
 # The default installer drops uv under /root (mode 700); coder couldn't read it.
 # Install uv into /usr/local/bin and the managed Python into /opt/uv/python,

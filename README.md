@@ -15,6 +15,7 @@
 - Zero-prompt startup — authenticate once, then every run drops straight into Claude (no theme picker, trust dialog, or re-login)
 - VS Code Remote-SSH support — Claude's bash commands run inside the container, not on your host
 - Remote Control — expose the container to claude.ai/code and the Claude mobile app, then steer it from your phone or browser (outbound HTTPS only, no inbound port)
+- Built-in MCP servers — Context7 (up-to-date library docs) and Sequential Thinking are baked in; the GitHub MCP server turns on when you add a token
 - Selectable project directories — only the folders you explicitly pass with `-p` are visible to Claude
 - Optional GPU passthrough — NVIDIA and AMD both supported
 
@@ -52,10 +53,11 @@
    - [Mode B: VS Code Remote-SSH](#mode-b-vs-code-remote-ssh)
    - [Mode C: Access from a Remote Machine](#mode-c-access-from-a-remote-machine)
    - [Mode D: Remote Control — drive from claude.ai/code](#mode-d-remote-control--drive-from-claudeaicode)
-7. [GPU Support](#7-gpu-support)
-8. [Advanced: Sharing Host Python Packages](#8-advanced-sharing-host-python-packages)
-9. [Updating the Image](#9-updating-the-image)
-10. [Troubleshooting](#10-troubleshooting)
+7. [MCP Servers](#7-mcp-servers)
+8. [GPU Support](#8-gpu-support)
+9. [Advanced: Sharing Host Python Packages](#9-advanced-sharing-host-python-packages)
+10. [Updating the Image](#10-updating-the-image)
+11. [Troubleshooting](#11-troubleshooting)
 
 ---
 
@@ -67,7 +69,7 @@
 | **Anthropic account** | [console.anthropic.com](https://console.anthropic.com) |
 | **SSH key pair** | `ls ~/.ssh/id_*.pub` — generate: `ssh-keygen -t ed25519` |
 | **VS Code** *(optional)* | With [Remote - SSH](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-ssh) extension |
-| **NVIDIA drivers** *(optional)* | Required only for `--gpu-nvidia` — see [Section 7](#7-gpu-support) |
+| **NVIDIA drivers** *(optional)* | Required only for `--gpu-nvidia` — see [Section 8](#8-gpu-support) |
 
 ---
 
@@ -417,7 +419,38 @@ Because nothing inbound is exposed, this works through NAT and firewalls with no
 
 ---
 
-## 7. GPU Support
+## 7. MCP Servers
+
+The container ships with [MCP](https://modelcontextprotocol.io) servers so Claude has better tools out of the box. They're registered at **user scope** — `run.sh` writes them into the auth folder's `.claude.json` on every run — so they load in **every** project and every mode (local, `--rc`, and a manual `claude` over `--ssh`) with **no approval prompt**.
+
+| Server | What it does | Enabled | Auth |
+|---|---|---|---|
+| **context7** | Up-to-date, version-specific library/API docs pulled on demand | Always | Optional `CONTEXT7_API_KEY` (higher rate limits) |
+| **sequential-thinking** | A step-by-step reasoning scaffold for harder problems | Always | None |
+| **github** | Issues, PRs, and repos via the GitHub API | Only when `GITHUB_PERSONAL_ACCESS_TOKEN` is set | Your token, sent as a Bearer header |
+
+`context7` and `sequential-thinking` run **inside the container** as stdio servers (their npm packages are baked into the image). `github` is GitHub's **remote** endpoint (`https://api.githubcopilot.com/mcp/`) — nothing is baked for it; it's added only when you provide a token.
+
+**Turn on / configure** (optional) in `.env`:
+```bash
+CONTEXT7_API_KEY=ctx7sk-...              # free key from context7.com/dashboard — higher limits
+GITHUB_PERSONAL_ACCESS_TOKEN=ghp_...     # enables the GitHub MCP server
+```
+
+**Verify** inside the container:
+```bash
+claude mcp list        # context7 ✓, sequential-thinking ✓ (github ✓ only with a token)
+# or run /mcp inside an interactive Claude session to see each server's tools
+```
+Then ask, e.g., *"use context7 to get the current Next.js App Router docs."*
+
+**Remove one**: delete its key from `mcpServers` in `~/.codingseal/claude-auth/.claude.json` (and, for `github`, unset the token so `run.sh` doesn't re-add it).
+
+> Context7's stdio server still reaches Context7's cloud for the actual doc content, so the container needs outbound network. It works anonymously (rate-limited) without a key.
+
+---
+
+## 8. GPU Support
 
 ### NVIDIA
 
@@ -475,7 +508,7 @@ scripts/run.sh -p ~/projects/myproject
 
 ---
 
-## 8. Advanced: Sharing Host Python Packages
+## 9. Advanced: Sharing Host Python Packages
 
 If you have a large Python environment on your host and want to avoid reinstalling packages in the container, mount your host's site-packages read-only.
 
@@ -501,7 +534,7 @@ Packages installed with `uv pip install` inside the container go into the contai
 
 ---
 
-## 9. Updating the Image
+## 10. Updating the Image
 
 **When do you need to rebuild?**
 
@@ -523,7 +556,7 @@ CLAUDE_IMAGE=localhost/coding-seal:py311 scripts/run.sh -p ~/projects/myproject
 
 ---
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
