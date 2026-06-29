@@ -7,10 +7,16 @@ GPU_FLAGS=()
 PROJECT_MOUNTS=()
 MODE="local"            # "local"  → interactive TTY, claude starts immediately
                         # "remote" → detached, container stays up for SSH access
-                        # "auth"   → interactive, runs `claude auth login`, saves token to named volume
+                        # "auth"   → interactive, runs `claude auth login`, saves token to the auth dir
 IMAGE="${CLAUDE_IMAGE:-localhost/coding-seal:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-coding-seal}"
-CLAUDE_VOLUME="${CLAUDE_VOLUME:-claude-auth}"
+# Persistent auth lives in a FIXED host directory, not a podman named volume.
+# Named volumes follow podman's storage root, which the VS Code snap relocates
+# into its sandbox (~/snap/code/<rev>/...). That made login land in one volume
+# and the next run read a different, empty one. A bind-mount to a stable $HOME
+# path is identical whether run.sh is launched from a normal shell or inside the
+# VS Code snap, so the login always persists. Override with CLAUDE_AUTH_DIR.
+CLAUDE_AUTH_DIR="${CLAUDE_AUTH_DIR:-${HOME}/.codingseal/claude-auth}"
 SSH_PORT="${SSH_PORT:-2222}"
 
 # ── Help ──────────────────────────────────────────────────────────────────
@@ -19,7 +25,8 @@ usage() {
 Usage: scripts/run.sh [OPTIONS]
 
 Options:
-  --auth                First-time setup: authenticate Claude and save token to the named volume
+  --auth                First-time setup: log in and save the token to the auth dir
+  --setup-token         Generate a long-lived OAuth token to paste into .env (Claude subscription)
   --gpu-nvidia          Pass through NVIDIA GPU(s) via /dev/nvidia* devices
   --gpu-amd             Pass through AMD GPU via /dev/kfd and /dev/dri
   --no-gpu              Run without GPU (default)
@@ -31,12 +38,14 @@ Options:
   -h, --help            Show this help
 
 Environment variables (set these before running):
-  ANTHROPIC_API_KEY     Your Anthropic API key (or leave blank and use --auth instead)
-  SSH_PUBLIC_KEY        Public key injected into container's authorized_keys
-  SSH_PORT, CONTAINER_NAME, CLAUDE_IMAGE, CLAUDE_VOLUME  Override defaults
+  CLAUDE_CODE_OAUTH_TOKEN  Long-lived token from --setup-token (recommended, subscription)
+  ANTHROPIC_API_KEY        A console.anthropic.com API key (alternative to the token)
+  SSH_PUBLIC_KEY           Public key injected into container's authorized_keys
+  CLAUDE_AUTH_DIR          Host dir for persistent login (default: ~/.codingseal/claude-auth)
+  SSH_PORT, CONTAINER_NAME, CLAUDE_IMAGE  Override defaults
 
 Examples:
-  # First-time: authenticate once, token saved to persistent volume
+  # First-time: authenticate once, token saved to ~/.codingseal/claude-auth
   scripts/run.sh --auth
 
   # Interactive session with one project
@@ -84,9 +93,15 @@ while [[ $# -gt 0 ]]; do
             ABSPATH=$(realpath "$2")
             # :Z = private SELinux label (no-op when SELinux is disabled, correct on Fedora/RHEL)
             PROJECT_MOUNTS+=("--volume" "${ABSPATH}:${ABSPATH}:Z")
+            # Start Claude inside the FIRST project so it opens in your code,
+            # not the empty /home/coder. Extra -p dirs stay accessible by path.
+            [[ -z "${FIRST_PROJECT:-}" ]] && FIRST_PROJECT="${ABSPATH}"
             shift 2 ;;
         --auth)
             MODE="auth"
+            shift ;;
+        --setup-token)
+            MODE="setup-token"
             shift ;;
         --remote)
             MODE="remote"
@@ -105,25 +120,37 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ── Ensure the auth volume exists ─────────────────────────────────────────
-if ! podman volume exists "${CLAUDE_VOLUME}" 2>/dev/null; then
-    echo "Creating named volume '${CLAUDE_VOLUME}' for persistent Claude auth..."
-    podman volume create "${CLAUDE_VOLUME}"
-fi
+# ── Ensure the persistent auth directory exists ───────────────────────────
+# A real host directory (not a named volume) so the location never depends on
+# podman's storage root — see CLAUDE_AUTH_DIR note above.
+mkdir -p "${CLAUDE_AUTH_DIR}"
 
 # ── Build base flags ──────────────────────────────────────────────────────
 PODMAN_FLAGS=(
     "--name"    "${CONTAINER_NAME}"
     "--rm"
-    # Auth token storage — survives container restarts
-    # :z = shared SELinux label (named volumes can be shared between containers)
-    "--volume"  "${CLAUDE_VOLUME}:/root/.claude:z"
-    # SSH exposed on loopback only — remote access requires an SSH tunnel to the host first
-    "--publish"  "127.0.0.1:${SSH_PORT}:2222"
-    # Credentials passed as environment variables
-    "--env"     "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}"
+    # Map your host user (uid 1000) to the container's `coder` user so bind-mounted
+    # project files stay owned by you and remain writable inside the container.
+    # --user 0 starts the entrypoint as root (to set up sshd + drop to coder);
+    # keep-id alone would start as uid 1000 and break that setup.
+    "--userns=keep-id"
+    "--user"    "0"
+    # Auth token storage — a fixed host dir, so login persists across restarts
+    # AND across snap/non-snap invocations. :Z applies a private SELinux label
+    # (no-op on Ubuntu, correct on Fedora/RHEL).
+    "--volume"  "${CLAUDE_AUTH_DIR}:/home/coder/.claude:Z"
+    # SSH public key (always passed, entrypoint ignores if empty)
     "--env"     "SSH_PUBLIC_KEY=${SSH_PUBLIC_KEY:-}"
 )
+# NOTE: the SSH port (2222) is published ONLY in --remote mode (below). Local /
+# auth / setup-token sessions run `claude` directly and don't need SSH, so they
+# must NOT bind a host port — otherwise a second run (or a leftover container)
+# collides with "address already in use" on 127.0.0.1:2222.
+
+# Only pass credentials that are actually set — empty values would prevent
+# Claude from falling back to the credentials saved in the volume
+[[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] && PODMAN_FLAGS+=("--env" "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}")
+[[ -n "${ANTHROPIC_API_KEY:-}" ]] && PODMAN_FLAGS+=("--env" "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
 
 # Append GPU flags (array may be empty)
 if [[ ${#GPU_FLAGS[@]} -gt 0 ]]; then
@@ -135,16 +162,28 @@ if [[ ${#PROJECT_MOUNTS[@]} -gt 0 ]]; then
     PODMAN_FLAGS+=("${PROJECT_MOUNTS[@]}")
 fi
 
+# Open Claude in the first project directory (falls back to /home/coder if no -p)
+if [[ -n "${FIRST_PROJECT:-}" ]]; then
+    PODMAN_FLAGS+=("--workdir" "${FIRST_PROJECT}")
+fi
+
 # ── Mode-specific flags and command ───────────────────────────────────────
 if [[ "${MODE}" == "local" ]]; then
     PODMAN_FLAGS+=("--tty" "--interactive")
-    CMD=("claude" "--dangerouslySkipPermissions")
+    CMD=("claude")
 elif [[ "${MODE}" == "auth" ]]; then
     PODMAN_FLAGS+=("--tty" "--interactive")
     CMD=("claude" "auth" "login")
+elif [[ "${MODE}" == "setup-token" ]]; then
+    PODMAN_FLAGS+=("--tty" "--interactive")
+    CMD=("claude" "setup-token")
 else
-    # Detached: container stays running, users SSH in and start claude manually
-    PODMAN_FLAGS+=("--detach")
+    # Detached: container stays running, users SSH in and start claude manually.
+    # Only this mode needs the SSH port published on the host loopback.
+    PODMAN_FLAGS+=(
+        "--detach"
+        "--publish" "127.0.0.1:${SSH_PORT}:2222"
+    )
     CMD=("sleep" "infinity")
 fi
 
@@ -154,16 +193,23 @@ if [[ "${MODE}" == "auth" ]]; then
     echo ""
     echo "  A URL will appear below. Open it in your browser, complete the login,"
     echo "  then paste the code back into this terminal."
-    echo "  Your token will be saved to the '${CLAUDE_VOLUME}' volume for all future runs."
+    echo "  Your login will be saved to: ${CLAUDE_AUTH_DIR}"
+    echo ""
+fi
+if [[ "${MODE}" == "setup-token" ]]; then
+    echo ""
+    echo "  A URL will appear below. Open it in your browser, complete the login,"
+    echo "  then copy the long-lived token that is printed."
+    echo "  Add it to your .env as:  CLAUDE_CODE_OAUTH_TOKEN=<token>"
     echo ""
 fi
 if [[ "${MODE}" == "remote" ]]; then
     echo ""
     echo "  SSH into the container:"
-    echo "    ssh -p ${SSH_PORT} -i ~/.ssh/id_ed25519 root@localhost"
+    echo "    ssh -p ${SSH_PORT} -i ~/.ssh/id_ed25519 coder@localhost"
     echo ""
     echo "  Then start Claude:"
-    echo "    claude --dangerouslySkipPermissions"
+    echo "    claude"
     echo ""
     echo "  Stop the container:"
     echo "    podman stop ${CONTAINER_NAME}"
@@ -171,4 +217,25 @@ if [[ "${MODE}" == "remote" ]]; then
 fi
 
 # ── Run ───────────────────────────────────────────────────────────────────
+if [[ "${MODE}" == "auth" ]]; then
+    # Don't exec — after login we verify the credential file actually landed in
+    # the auth dir, so you get immediate confirmation instead of finding out next
+    # session that nothing was saved.
+    podman run "${PODMAN_FLAGS[@]}" "${IMAGE}" "${CMD[@]}"
+    echo ""
+    # On Linux, Claude has no OS keychain: it stores the login as a plaintext
+    # file ".credentials.json" inside CLAUDE_CONFIG_DIR — which is this host dir.
+    # It's a normal directory, so we can just check it directly.
+    if [[ -f "${CLAUDE_AUTH_DIR}/.credentials.json" ]]; then
+        echo "✅ Login saved to ${CLAUDE_AUTH_DIR}/.credentials.json"
+        echo "   Future runs stay logged in — just: scripts/run.sh -p ~/your/project"
+    else
+        echo "⚠️  No .credentials.json was written to ${CLAUDE_AUTH_DIR}"
+        echo "   The login did not complete. Re-run 'scripts/run.sh --auth' and make sure"
+        echo "   you paste the code from the browser back into the terminal when prompted."
+        echo "   Or use the token method instead:  scripts/run.sh --setup-token"
+    fi
+    exit 0
+fi
+
 exec podman run "${PODMAN_FLAGS[@]}" "${IMAGE}" "${CMD[@]}"

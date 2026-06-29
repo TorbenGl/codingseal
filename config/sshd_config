@@ -1,8 +1,8 @@
 Port 2222
 ListenAddress 0.0.0.0
 
-# Authentication — key-only, no passwords
-PermitRootLogin prohibit-password
+# Authentication — key-only, no passwords. Login is the non-root `coder` user.
+PermitRootLogin no
 PasswordAuthentication no
 ChallengeResponseAuthentication no
 UsePAM no
@@ -24,6 +24,10 @@ ClientAliveCountMax 3
 
 # Forward ANTHROPIC_API_KEY from SSH client via: ssh -o SendEnv=ANTHROPIC_API_KEY
 AcceptEnv ANTHROPIC_API_KEY LANG LC_*
+
+# NOTE: the `SetEnv` line that gives SSH sessions CLAUDE_CONFIG_DIR and any
+# runtime credential is appended by entrypoint.sh before sshd starts (it has to
+# include runtime values, so it can't be hard-coded here).
 
 # Log to stderr so `podman logs` captures it
 SyslogFacility AUTH

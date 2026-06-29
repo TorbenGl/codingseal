@@ -1,5 +1,9 @@
 {
+  "theme": "dark",
+  "tui": "default",
+  "skipDangerousModePermissionPrompt": true,
   "permissions": {
+    "defaultMode": "bypassPermissions",
     "allow": [
       "Bash(*)",
       "Read(*)",
@@ -16,6 +20,5 @@
       "Agent(*)"
     ],
     "deny": []
-  },
-  "dangerouslySkipPermissions": true
+  }
 }

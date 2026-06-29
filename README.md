@@ -11,7 +11,7 @@
 
 **What you get:**
 - Claude Code with full permissions inside a container — `rm -rf /` can only hurt the container, never your host
-- Persistent authentication — authenticate once with `scripts/run.sh --auth`, token lives in a named volume forever
+- Zero-prompt startup — authenticate once, then every run drops straight into Claude (no theme picker, trust dialog, or re-login)
 - VS Code Remote-SSH support — Claude's bash commands run inside the container, not on your host
 - Selectable project directories — only the folders you explicitly pass with `-p` are visible to Claude
 - Optional GPU passthrough — NVIDIA and AMD both supported
@@ -32,7 +32,7 @@
 │  │   sshd (port 2222) ◄── VS Code Remote-SSH           │  │  │
 │  └────────────────────────────────────────────────────────┘  │
 │       bind-mounts ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┘                 │
-│       named volume: claude-auth → ~/.claude/ (token)         │
+│       host dir: ~/.codingseal/claude-auth → ~/.claude/ (token)│
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -82,11 +82,14 @@ cp .env.example .env
 # 2. Build the image (~5 minutes)
 podman build -t coding-seal:latest .
 
-# 3. Authenticate Claude (browser flow, token saved permanently)
-set -a && source .env && set +a
-scripts/run.sh --auth
+# 3. Authenticate Claude once (see Section 4 for all options).
+#    Recommended: generate a long-lived token and put it in .env
+scripts/run.sh --setup-token
+#    → open the printed URL, log in, copy the token, then add to .env:
+#      CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
 
-# 4. Start working
+# 4. Start working — drops straight into Claude, no prompts
+set -a && source .env && set +a
 scripts/run.sh -p ~/projects/myproject
 ```
 
@@ -102,7 +105,7 @@ scripts/run.sh -p ~/projects/myproject
 
 ## 3. Security Model
 
-### Why `--dangerouslySkipPermissions` is safe here
+### Why full permissions are safe here
 
 Claude Code normally prompts before every file write, shell command, and web request. Those prompts are disabled inside this container. This is intentional and safe because:
 
@@ -125,53 +128,83 @@ Claude Code normally prompts before every file write, shell command, and web req
 
 ## 4. First-Time Authentication
 
-Claude Code needs an Anthropic account token to work. You have two options.
+Claude needs credentials to start. After one-time setup, **every run drops you straight into Claude — no theme picker, no "trust this folder?" prompt, no login.** The image bakes in the settings that suppress those wizards, and `CLAUDE_CONFIG_DIR` points Claude's entire state directory at a fixed host folder (`~/.codingseal/claude-auth`) so your login persists across runs.
 
-### Option A — Browser login (recommended)
+> **Why a host folder and not a podman named volume?** A named volume lives under podman's storage root, and the VS Code snap relocates that root into its sandbox (`~/snap/code/<rev>/…`). Logging in from one place and restarting from another then hits two different, empty volumes — so the login "vanishes". A bind-mounted host folder is the same path everywhere, snap or not.
 
-Authenticate once. The token lives in the `claude-auth` named Podman volume and is reused automatically on every subsequent run.
+Pick **one** of these three methods.
+
+### Option A — Long-lived OAuth token (recommended for Claude subscriptions)
+
+Generate a token once and store it in `.env`. Works with a Claude Pro/Max subscription — no API billing.
+
+```bash
+scripts/run.sh --setup-token
+# A URL is printed → open it in your host browser → log in →
+# copy the printed token (starts with sk-ant-oat...)
+```
+
+Paste it into `.env`:
+```bash
+CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
+```
+
+Done. Every run is now fully non-interactive.
+
+### Option B — Persistent browser login (saved in the volume)
+
+Leave the token/key blank in `.env` and log in once:
 
 ```bash
 set -a && source .env && set +a
 scripts/run.sh --auth
+# URL → host browser → log in → paste code back → container exits
 ```
 
-What happens:
-1. The container starts and runs `claude auth login`
-2. A URL is printed to your terminal
-3. Open that URL in your **host browser** (the container has no browser)
-4. Complete the Anthropic login flow
-5. Paste the code back into the terminal
-6. The container exits — your token is saved
+On Linux there is no OS keychain, so Claude saves the login as a plaintext file —
+`.credentials.json` (mode 600) — inside `CLAUDE_CONFIG_DIR`, which is the host
+folder below. `--auth` verifies the file landed and prints `✅ Login saved…` on
+success (or a `⚠️` with next steps if the browser step wasn't completed).
 
-The token lives at:
+The login is saved in a plain host folder:
 ```
-~/.local/share/containers/storage/volumes/claude-auth/
+~/.codingseal/claude-auth/.credentials.json
 ```
+It is user-scoped on your host (mode 600, only you can read it) and reused automatically on every subsequent run — from a normal terminal or the VS Code snap alike. Security is equivalent to storing the token at `~/.claude/` directly on your host. Override the location with `CLAUDE_AUTH_DIR`.
 
-This is user-scoped on your host — other users on the machine cannot access it. Security is equivalent to storing the token at `~/.claude/` directly on your host.
-
-**Check that authentication worked:**
+Remove saved credentials with:
 ```bash
-scripts/run.sh -p /tmp
-# Inside: claude --version   ← should start without asking for auth
+rm -rf ~/.codingseal/claude-auth
 ```
 
-**Remove saved credentials:**
-```bash
-podman volume rm claude-auth
-```
+### Option C — API key (pay-per-token API billing)
 
-### Option B — API key (stateless, no login needed)
-
-If you prefer not to use browser login, set your API key in `.env`:
+Set your [console.anthropic.com](https://console.anthropic.com/account/keys) key in `.env`:
 
 ```bash
-# In .env:
 ANTHROPIC_API_KEY=sk-ant-api03-...
 ```
 
-The key is passed as an environment variable each run. Nothing is stored in the container.
+Passed as an environment variable each run. Nothing is stored in the container.
+
+### Why there are no setup prompts
+
+The container is configured so Claude never stops to ask:
+
+| Prompt you would normally see | How it's suppressed |
+|---|---|
+| Theme / color picker | `hasCompletedOnboarding: true` seeded in `.claude.json` |
+| "Do you trust the files in this folder?" | `projects["/"].hasTrustDialogAccepted: true` — trust inherits down to every mounted dir |
+| Bypass-permissions mode (no per-tool prompts) | `permissions.defaultMode: bypassPermissions` in settings.json |
+| "Yes, I accept bypass mode" warning | `skipDangerousModePermissionPrompt: true` in settings.json (the durable key; the old `.claude.json` flag gets migrated away each run) |
+| "Cannot skip permissions as root" | Claude runs as a **non-root `coder` user** — the guard only triggers for root, so the check never fires (no env trick needed) |
+| "Try the new fullscreen renderer?" | `tui: "default"` pinned in settings.json — any explicit `tui` value suppresses the upsell (use `"fullscreen"` if you prefer the flicker-free alt-screen UI) |
+| Re-login on every run | `CLAUDE_CONFIG_DIR` stores credentials in the persistent host auth folder |
+| Prompts/login still appear over **SSH / VS Code** | sshd starts a clean environment, so the entrypoint injects `CLAUDE_CONFIG_DIR` and your credential into every SSH session via sshd's `SetEnv` |
+
+These are applied automatically by [entrypoint.sh](entrypoint.sh) and [config/claude-settings.json](config/claude-settings.json) — you don't need to do anything.
+
+> **Authenticating for the SSH / VS Code path:** because SSH sessions don't see `podman run --env` values directly, the entrypoint forwards your `.env` credential (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`) into SSH sessions for you. A volume-stored `--auth` login (Option B) also works over SSH, since the credentials file lives in the volume that every session reads. For headless/remote use the token in `.env` (Option A) is the most reliable, since it needs no interactive step at all.
 
 ---
 
@@ -186,6 +219,8 @@ scripts/run.sh \
   -p ~/projects/infra \
   -p ~/datasets/training-data
 ```
+
+Claude **opens in the first `-p` directory** (its working directory), so it starts right in your code instead of the empty `/home/coder` home. The other `-p` directories stay fully accessible by their paths.
 
 Each directory is mounted at the **same absolute path** inside the container. If your project is at `/home/alice/projects/myapp` on the host, Claude sees it at `/home/alice/projects/myapp` inside too. This means:
 
@@ -211,17 +246,18 @@ set -a && source .env && set +a
 scripts/run.sh -p ~/projects/myproject
 ```
 
-You land directly in `claude --dangerouslySkipPermissions`. Type your task. Claude's bash commands run in the container.
+You land directly in `claude`. Type your task. Claude's bash commands run in the container.
 
-To get a plain shell instead:
+To get a plain shell instead (note `--userns=keep-id --user 0`, which `run.sh` adds for you — the entrypoint starts as root then drops you to `coder`):
 ```bash
 podman run -it --rm \
-  --volume claude-auth:/root/.claude:z \
-  --publish 127.0.0.1:2222:2222 \
+  --userns=keep-id --user 0 \
+  --volume ~/.codingseal/claude-auth:/home/coder/.claude:Z \
   --env SSH_PUBLIC_KEY \
   --volume ~/projects/myproject:~/projects/myproject:Z \
   localhost/coding-seal:latest \
   bash
+# (add `--publish 127.0.0.1:2222:2222` only if you also want to SSH in — see Mode B)
 ```
 
 ---
@@ -258,10 +294,10 @@ Output:
 Starting container 'coding-seal'...
 
   SSH into the container:
-    ssh -p 2222 -i ~/.ssh/id_ed25519 root@localhost
+    ssh -p 2222 -i ~/.ssh/id_ed25519 coder@localhost
 
   Then start Claude:
-    claude --dangerouslySkipPermissions
+    claude
 
   Stop the container:
     podman stop coding-seal
@@ -275,7 +311,7 @@ cat >> ~/.ssh/config << 'EOF'
 Host claude-container
     HostName 127.0.0.1
     Port 2222
-    User root
+    User coder
     IdentityFile ~/.ssh/id_ed25519
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
@@ -318,7 +354,7 @@ From the VS Code integrated terminal:
 ```bash
 claude
 # or if you want to be explicit:
-claude --dangerouslySkipPermissions
+claude
 ```
 
 From this point on, every bash command Claude runs executes as a container process. Claude cannot touch your host filesystem beyond what is mounted.
@@ -343,7 +379,7 @@ On your local machine:
 ssh -N -L 2222:localhost:2222 youruser@your-workstation-ip
 
 # Terminal 2: connect to the container through the tunnel
-ssh -p 2222 -i ~/.ssh/id_ed25519 root@localhost
+ssh -p 2222 -i ~/.ssh/id_ed25519 coder@localhost
 ```
 
 **Option 2 — ProxyJump (one step, works with VS Code)**
@@ -358,7 +394,7 @@ Host your-workstation
 Host claude-remote
     HostName 127.0.0.1
     Port 2222
-    User root
+    User coder
     IdentityFile ~/.ssh/id_ed25519
     ProxyJump your-workstation
     StrictHostKeyChecking no
@@ -439,7 +475,8 @@ python3 -c "import site; print('\n'.join(site.getsitepackages()))"
 
 # Add to the run command
 podman run -it --rm \
-  --volume claude-auth:/root/.claude:z \
+  --userns=keep-id --user 0 \
+  --volume ~/.codingseal/claude-auth:/home/coder/.claude:Z \
   --publish 127.0.0.1:2222:2222 \
   --env ANTHROPIC_API_KEY \
   --env SSH_PUBLIC_KEY \
@@ -448,7 +485,7 @@ podman run -it --rm \
   --volume ~/.local/lib/python3.12/site-packages:/mnt/host-python/user-packages:ro,Z \
   --env PYTHONPATH=/mnt/host-python/dist-packages:/mnt/host-python/user-packages \
   localhost/coding-seal:latest \
-  claude --dangerouslySkipPermissions
+  claude
 ```
 
 Packages installed with `uv pip install` inside the container go into the container's own layer and don't affect your host.
@@ -456,6 +493,13 @@ Packages installed with `uv pip install` inside the container go into the contai
 ---
 
 ## 9. Updating the Image
+
+**When do you need to rebuild?**
+
+| You changed… | Rebuild needed? |
+|---|---|
+| `Containerfile`, `entrypoint.sh`, `config/sshd_config`, `config/claude-settings.json` (e.g. the `coder` user, the `tui` setting) | **Yes** — these are baked into the image: `podman build -t coding-seal:latest .` |
+| `scripts/run.sh`, `.env` (mounts, GPU flags, auth dir, tokens) | No — they take effect on the next run |
 
 **Full update** (base OS + Node.js + Claude Code + uv):
 ```bash
@@ -474,15 +518,20 @@ CLAUDE_IMAGE=localhost/coding-seal:py311 scripts/run.sh -p ~/projects/myproject
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `claude` asks to authenticate on every run | No saved token | Run `scripts/run.sh --auth` once, then future runs read from the `claude-auth` volume |
-| `claude` exits with "Please authenticate" | Named volume was deleted | `podman volume ls \| grep claude-auth` — if missing, run `--auth` again |
+| Theme picker / trust prompt / login appears | Image built before these fixes | Rebuild: `podman build -t coding-seal:latest .` (seeds the wizard-suppression state) |
+| `claude` asks to authenticate on every run | No saved credentials, or the `--auth` browser step was never completed | Most reliable: set `CLAUDE_CODE_OAUTH_TOKEN` in `.env` (via `--setup-token`). For `--auth`, confirm it printed `✅ Login saved…`; verify with `ls -l ~/.codingseal/claude-auth/.credentials.json` |
+| `--auth` says it saved, but the next run still asks to log in | Older versions stored auth in a podman **named volume**, whose location follows podman's storage root — and the VS Code snap relocates that root into its sandbox (`~/snap/code/<rev>/…`), so login and restart hit different empty volumes | Fixed: `run.sh` now bind-mounts a fixed host folder (`~/.codingseal/claude-auth`) that's identical in every context. Just `scripts/run.sh --auth` once more. (You can delete the stale `claude-auth` named volume: `podman volume rm claude-auth`.) |
+| `--auth` login doesn't stick | Browser code not pasted back, or `~/.codingseal/claude-auth` was deleted between runs | Re-run `scripts/run.sh --auth`, paste the code when prompted, and confirm `~/.codingseal/claude-auth/.credentials.json` exists |
+| `--dangerously-skip-permissions cannot be used with root` | Old image that ran as root | Rebuild — the image now runs Claude as the non-root `coder` user; confirm with `podman exec coding-seal whoami` (should print `coder` for the Claude process) |
+| `Invalid API key` | Bad/expired credential | Regenerate with `scripts/run.sh --setup-token` and update `.env` |
+| `rootlessport listen tcp 127.0.0.1:2222: bind: address already in use` | Another container already holds the SSH port | Only `--remote` publishes 2222 now, so local runs no longer collide. If you still see it, a `--remote` container is up — `podman ps`, then `podman stop coding-seal` (or `--port 2223` for a second one). A container started from a normal terminal may be invisible to `podman ps` run inside the VS Code snap (different storage root) — stop it from the terminal you started it in |
 | `ssh: connect to host localhost port 2222: Connection refused` | Container not running or sshd didn't start | `podman ps`; `podman logs coding-seal` for sshd errors |
-| `Permission denied (publickey)` via SSH | Wrong key or key not injected | Check `SSH_PUBLIC_KEY` is set; `podman exec coding-seal cat /root/.ssh/authorized_keys` |
+| `Permission denied (publickey)` via SSH | Wrong key or key not injected | Check `SSH_PUBLIC_KEY` is set; `podman exec --user coder coding-seal cat /home/coder/.ssh/authorized_keys` |
 | VS Code says "Cannot connect to remote" | Container not running | Start with `scripts/run.sh --remote -p ...` first |
 | Claude Code extension runs on local, not inside container | Extension not installed on the remote | Extensions panel → Claude Code → "Install in SSH: claude-container" |
 | Claude's bash commands run on your host | VS Code not connected to container | Check VS Code title bar shows `[SSH: claude-container]` |
 | `claude: command not found` | PATH issue | `which claude` inside container; rebuild if missing |
-| Project files appear owned by a large UID | Expected with rootless Podman | Container root (uid 0) can still read/write them — cosmetic only |
+| Project files owned by the wrong UID / not writable | `--userns=keep-id` not applied | `run.sh` sets it so your host user maps to `coder`; verify files you create inside appear owned by you on the host |
 | `Permission denied` on project files | SELinux denying the mount | The `:Z` flag in `run.sh` handles this — verify you are using `run.sh` not a manual command |
 | NVIDIA GPU not visible inside container | Devices not passed through | Use `--gpu-nvidia`; verify `ls -l /dev/nvidia*` on host shows your devices |
 | AMD GPU not visible | Group membership issue | `--gpu-amd` includes `--group-add keep-groups`; check `/dev/kfd` exists on host |
@@ -501,7 +550,7 @@ codingseal/
 ├── entrypoint.sh             ← Container startup: injects SSH key, starts sshd, runs CMD
 ├── .env.example              ← Copy to .env and fill in your credentials
 ├── scripts/
-│   └── run.sh                ← Wrapper: --auth, --gpu-nvidia/amd, -p PATH, --remote
+│   └── run.sh                ← Wrapper: --setup-token, --auth, --gpu-nvidia/amd, -p PATH, --remote
 └── config/
     ├── sshd_config           ← Port 2222, key-only auth, VS Code keepalive
     └── claude-settings.json  ← dangerouslySkipPermissions + full allow list
