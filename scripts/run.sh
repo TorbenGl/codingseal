@@ -6,7 +6,9 @@ set -euo pipefail
 GPU_FLAGS=()
 PROJECT_MOUNTS=()
 MODE="local"            # "local"  → interactive TTY, claude starts immediately
-                        # "remote" → detached, container stays up for SSH access
+                        # "remote" → Remote Control: foreground, runs `claude remote-control`
+                        #            so claude.ai/code + the Claude app can drive this env
+                        # "ssh"    → detached, container stays up for SSH / VS Code Remote-SSH
                         # "auth"   → interactive, runs `claude auth login`, saves token to the auth dir
 IMAGE="${CLAUDE_IMAGE:-localhost/coding-seal:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-coding-seal}"
@@ -31,8 +33,11 @@ Options:
   --gpu-amd             Pass through AMD GPU via /dev/kfd and /dev/dri
   --no-gpu              Run without GPU (default)
   -p, --project PATH    Bind-mount a project directory (repeatable)
-  --remote              Headless mode: container stays running for SSH/remote access
-  --port PORT           SSH port on localhost (default: 2222)
+  --remote              Remote Control: run `claude remote-control` so claude.ai/code
+                        and the Claude mobile app can drive this environment
+                        (needs a full claude.ai login — run --auth first)
+  --ssh                 Headless mode: container stays running for SSH / VS Code Remote-SSH
+  --port PORT           SSH port on localhost, used by --ssh (default: 2222)
   --name NAME           Container name (default: coding-seal)
   --image IMAGE         Image to use (default: localhost/coding-seal:latest)
   -h, --help            Show this help
@@ -54,8 +59,11 @@ Examples:
   # Multiple projects
   scripts/run.sh -p ~/projects/myapp -p ~/projects/infra
 
-  # Headless (SSH / VS Code Remote)
+  # Remote Control — drive this container from claude.ai/code or the Claude app
   scripts/run.sh --remote -p ~/projects/myapp
+
+  # Headless SSH / VS Code Remote-SSH
+  scripts/run.sh --ssh -p ~/projects/myapp
 
   # With NVIDIA GPU
   scripts/run.sh --gpu-nvidia -p ~/projects/ml
@@ -106,6 +114,9 @@ while [[ $# -gt 0 ]]; do
         --remote)
             MODE="remote"
             shift ;;
+        --ssh)
+            MODE="ssh"
+            shift ;;
         --port)
             SSH_PORT="$2"
             shift 2 ;;
@@ -142,15 +153,23 @@ PODMAN_FLAGS=(
     # SSH public key (always passed, entrypoint ignores if empty)
     "--env"     "SSH_PUBLIC_KEY=${SSH_PUBLIC_KEY:-}"
 )
-# NOTE: the SSH port (2222) is published ONLY in --remote mode (below). Local /
-# auth / setup-token sessions run `claude` directly and don't need SSH, so they
-# must NOT bind a host port — otherwise a second run (or a leftover container)
-# collides with "address already in use" on 127.0.0.1:2222.
+# NOTE: the SSH port (2222) is published ONLY in --ssh mode (below). All other
+# modes (local / remote-control / auth / setup-token) run `claude` directly and
+# don't need SSH, so they must NOT bind a host port — otherwise a second run (or
+# a leftover container) collides with "address already in use" on 127.0.0.1:2222.
 
 # Only pass credentials that are actually set — empty values would prevent
-# Claude from falling back to the credentials saved in the volume
-[[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] && PODMAN_FLAGS+=("--env" "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}")
-[[ -n "${ANTHROPIC_API_KEY:-}" ]] && PODMAN_FLAGS+=("--env" "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
+# Claude from falling back to the credentials saved in the volume.
+# EXCEPTION: Remote Control (--remote) rejects inference-only credentials. A
+# CLAUDE_CODE_OAUTH_TOKEN (from --setup-token) or an ANTHROPIC_API_KEY cannot
+# establish a Remote Control session — it needs the full-scope claude.ai login
+# saved by --auth (the .credentials.json in the auth dir). If we passed a token,
+# Claude would pick it over the saved login and remote-control would fail with
+# "requires a full-scope login token", so in remote mode we deliberately skip them.
+if [[ "${MODE}" != "remote" ]]; then
+    [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] && PODMAN_FLAGS+=("--env" "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}")
+    [[ -n "${ANTHROPIC_API_KEY:-}" ]] && PODMAN_FLAGS+=("--env" "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
+fi
 
 # Append GPU flags (array may be empty)
 if [[ ${#GPU_FLAGS[@]} -gt 0 ]]; then
@@ -177,9 +196,19 @@ elif [[ "${MODE}" == "auth" ]]; then
 elif [[ "${MODE}" == "setup-token" ]]; then
     PODMAN_FLAGS+=("--tty" "--interactive")
     CMD=("claude" "setup-token")
+elif [[ "${MODE}" == "remote" ]]; then
+    # Remote Control: expose THIS container's environment to claude.ai/code and
+    # the Claude mobile app. The connection is outbound HTTPS only — Claude
+    # registers with the Anthropic API and polls for work — so there's NO inbound
+    # port and no --publish. Runs in the foreground with a TTY so the session URL
+    # (and the spacebar QR code) are visible; the process must stay alive to host
+    # the session, so stopping it ends the remote session.
+    PODMAN_FLAGS+=("--tty" "--interactive")
+    CMD=("claude" "remote-control")
 else
-    # Detached: container stays running, users SSH in and start claude manually.
-    # Only this mode needs the SSH port published on the host loopback.
+    # MODE == "ssh": detached, container stays running, you SSH in and start
+    # claude manually (e.g. via VS Code Remote-SSH). Only this mode needs the SSH
+    # port published on the host loopback.
     PODMAN_FLAGS+=(
         "--detach"
         "--publish" "127.0.0.1:${SSH_PORT}:2222"
@@ -204,6 +233,21 @@ if [[ "${MODE}" == "setup-token" ]]; then
     echo ""
 fi
 if [[ "${MODE}" == "remote" ]]; then
+    echo ""
+    echo "  Remote Control — drive this environment from claude.ai/code or the Claude app."
+    echo "  A session URL appears below (press spacebar for a QR code). Keep this"
+    echo "  process running; stopping it ends the remote session."
+    echo ""
+    echo "  Remote Control needs a full claude.ai login — a CLAUDE_CODE_OAUTH_TOKEN or"
+    echo "  ANTHROPIC_API_KEY won't work, so they are NOT passed in this mode."
+    if [[ ! -f "${CLAUDE_AUTH_DIR}/.credentials.json" ]]; then
+        echo ""
+        echo "  ⚠️  No login found at ${CLAUDE_AUTH_DIR}/.credentials.json."
+        echo "     Run 'scripts/run.sh --auth' once first, then retry."
+    fi
+    echo ""
+fi
+if [[ "${MODE}" == "ssh" ]]; then
     echo ""
     echo "  SSH into the container:"
     echo "    ssh -p ${SSH_PORT} -i ~/.ssh/id_ed25519 coder@localhost"

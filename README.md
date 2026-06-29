@@ -4,7 +4,8 @@
   # CodingSeal — Claude Code in a Podman Container
 
   *Give Claude Code unrestricted tool access inside a rootless Podman container.
-  Your host stays completely isolated. Connect via terminal, VS Code, or from a remote machine.*
+  Your host stays completely isolated. Connect via terminal, VS Code, from a remote machine,
+  or drive it live from claude.ai/code and the Claude app with Remote Control.*
 </div>
 
 ---
@@ -13,6 +14,7 @@
 - Claude Code with full permissions inside a container — `rm -rf /` can only hurt the container, never your host
 - Zero-prompt startup — authenticate once, then every run drops straight into Claude (no theme picker, trust dialog, or re-login)
 - VS Code Remote-SSH support — Claude's bash commands run inside the container, not on your host
+- Remote Control — expose the container to claude.ai/code and the Claude mobile app, then steer it from your phone or browser (outbound HTTPS only, no inbound port)
 - Selectable project directories — only the folders you explicitly pass with `-p` are visible to Claude
 - Optional GPU passthrough — NVIDIA and AMD both supported
 
@@ -49,6 +51,7 @@
    - [Mode A: Local Interactive Terminal](#mode-a-local-interactive-terminal)
    - [Mode B: VS Code Remote-SSH](#mode-b-vs-code-remote-ssh)
    - [Mode C: Access from a Remote Machine](#mode-c-access-from-a-remote-machine)
+   - [Mode D: Remote Control — drive from claude.ai/code](#mode-d-remote-control--drive-from-claudeaicode)
 7. [GPU Support](#7-gpu-support)
 8. [Advanced: Sharing Host Python Packages](#8-advanced-sharing-host-python-packages)
 9. [Updating the Image](#9-updating-the-image)
@@ -282,11 +285,11 @@ This is exactly what you want: Claude operates in a sandboxed environment with n
 
 #### Step-by-step setup
 
-**Step 1 — Start the container in remote mode**
+**Step 1 — Start the container in SSH mode**
 
 ```bash
 set -a && source .env && set +a
-scripts/run.sh --remote -p ~/projects/myproject
+scripts/run.sh --ssh -p ~/projects/myproject
 ```
 
 Output:
@@ -402,6 +405,31 @@ Host claude-remote
 ```
 
 Then in VS Code's Remote-SSH: connect to `claude-remote`. VS Code hops through your workstation into the container transparently.
+
+---
+
+### Mode D: Remote Control — drive from claude.ai/code
+
+Instead of connecting *into* the container (SSH/VS Code), Remote Control runs Claude **inside the container** and exposes that session to [claude.ai/code](https://claude.ai/code) and the Claude mobile app. You drive the container from your phone or any browser; all work still happens in the container, against your mounted projects.
+
+The container makes **outbound HTTPS only** — it registers with the Anthropic API and polls for work, so it opens **no inbound port** and needs no SSH or tunnel. This is the easiest way to reach the container from another machine.
+
+```bash
+set -a && source .env && set +a
+scripts/run.sh --remote -p ~/projects/myproject
+```
+
+A session URL prints in the terminal (press **spacebar** for a QR code to open it on your phone). Open that URL — or find the session in the list at [claude.ai/code](https://claude.ai/code) / the Claude app — and start steering. Keep the process running: it hosts the session, so stopping it ends Remote Control.
+
+> **Authentication is different for this mode.** Remote Control needs a **full claude.ai login** — the credential from `scripts/run.sh --auth` (Option B), stored as `~/.codingseal/claude-auth/.credentials.json`. The recommended `CLAUDE_CODE_OAUTH_TOKEN` (from `--setup-token`, Option A) and `ANTHROPIC_API_KEY` (Option C) are **inference-only** and are rejected by Remote Control, so `--remote` deliberately does **not** pass them. If you've only used the token method, run `scripts/run.sh --auth` once first.
+
+| Requirement | Notes |
+|---|---|
+| **Plan** | Pro, Max, Team, or Enterprise. API keys are not supported. On Team/Enterprise an Owner must enable the **Remote Control** toggle in [Claude Code admin settings](https://claude.ai/admin-settings/claude-code). |
+| **Login** | A full claude.ai session login (`--auth`). A long-lived token / API key won't work. |
+| **Claude Code version** | The image installs the latest CLI; Remote Control server mode needs v2.1.51+ — rebuild the image if yours is older. |
+
+Because nothing inbound is exposed, this works through NAT and firewalls with no port forwarding — a simpler alternative to [Mode C](#mode-c-access-from-a-remote-machine) when you just want to reach the container from elsewhere.
 
 ---
 
@@ -524,10 +552,10 @@ CLAUDE_IMAGE=localhost/coding-seal:py311 scripts/run.sh -p ~/projects/myproject
 | `--auth` login doesn't stick | Browser code not pasted back, or `~/.codingseal/claude-auth` was deleted between runs | Re-run `scripts/run.sh --auth`, paste the code when prompted, and confirm `~/.codingseal/claude-auth/.credentials.json` exists |
 | `--dangerously-skip-permissions cannot be used with root` | Old image that ran as root | Rebuild — the image now runs Claude as the non-root `coder` user; confirm with `podman exec coding-seal whoami` (should print `coder` for the Claude process) |
 | `Invalid API key` | Bad/expired credential | Regenerate with `scripts/run.sh --setup-token` and update `.env` |
-| `rootlessport listen tcp 127.0.0.1:2222: bind: address already in use` | Another container already holds the SSH port | Only `--remote` publishes 2222 now, so local runs no longer collide. If you still see it, a `--remote` container is up — `podman ps`, then `podman stop coding-seal` (or `--port 2223` for a second one). A container started from a normal terminal may be invisible to `podman ps` run inside the VS Code snap (different storage root) — stop it from the terminal you started it in |
+| `rootlessport listen tcp 127.0.0.1:2222: bind: address already in use` | Another container already holds the SSH port | Only `--ssh` publishes 2222, so local and `--remote` runs no longer collide. If you still see it, an `--ssh` container is up — `podman ps`, then `podman stop coding-seal` (or `--port 2223` for a second one). A container started from a normal terminal may be invisible to `podman ps` run inside the VS Code snap (different storage root) — stop it from the terminal you started it in |
 | `ssh: connect to host localhost port 2222: Connection refused` | Container not running or sshd didn't start | `podman ps`; `podman logs coding-seal` for sshd errors |
 | `Permission denied (publickey)` via SSH | Wrong key or key not injected | Check `SSH_PUBLIC_KEY` is set; `podman exec --user coder coding-seal cat /home/coder/.ssh/authorized_keys` |
-| VS Code says "Cannot connect to remote" | Container not running | Start with `scripts/run.sh --remote -p ...` first |
+| VS Code says "Cannot connect to remote" | Container not running | Start with `scripts/run.sh --ssh -p ...` first |
 | Claude Code extension runs on local, not inside container | Extension not installed on the remote | Extensions panel → Claude Code → "Install in SSH: claude-container" |
 | Claude's bash commands run on your host | VS Code not connected to container | Check VS Code title bar shows `[SSH: claude-container]` |
 | `claude: command not found` | PATH issue | `which claude` inside container; rebuild if missing |
@@ -537,6 +565,9 @@ CLAUDE_IMAGE=localhost/coding-seal:py311 scripts/run.sh -p ~/projects/myproject
 | AMD GPU not visible | Group membership issue | `--gpu-amd` includes `--group-add keep-groups`; check `/dev/kfd` exists on host |
 | `claude auth login` URL doesn't open a browser | Container has no display | This is expected — copy the URL, paste it into your **host** browser |
 | VS Code keeps disconnecting | Missing SSH keepalive | `sshd_config` already sets `ClientAliveInterval 30`; check your local `~/.ssh/config` too |
+| `--remote`: "Remote Control requires a full-scope login token" | The container is using a `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` — these are inference-only | Run `scripts/run.sh --auth` once to save a full claude.ai login, then `scripts/run.sh --remote`. `--remote` already drops the token/key env vars, so an existing `.credentials.json` is used |
+| `--remote`: "Remote Control requires a claude.ai subscription" / "not yet enabled" | No claude.ai login, or feature not rolled out to your account | `scripts/run.sh --auth` to log in; confirm your plan supports it (Pro/Max/Team/Enterprise). On Team/Enterprise an Owner must enable the Remote Control toggle in admin settings |
+| `--remote`: no session URL appears / `claude: command not found` for `remote-control` | Image predates Remote Control (needs Claude Code v2.1.51+) | Rebuild: `podman build --pull=newer -t coding-seal:latest .` |
 
 ---
 
@@ -550,7 +581,7 @@ codingseal/
 ├── entrypoint.sh             ← Container startup: injects SSH key, starts sshd, runs CMD
 ├── .env.example              ← Copy to .env and fill in your credentials
 ├── scripts/
-│   └── run.sh                ← Wrapper: --setup-token, --auth, --gpu-nvidia/amd, -p PATH, --remote
+│   └── run.sh                ← Wrapper: --setup-token, --auth, --gpu-nvidia/amd, -p PATH, --remote, --ssh
 └── config/
     ├── sshd_config           ← Port 2222, key-only auth, VS Code keepalive
     └── claude-settings.json  ← dangerouslySkipPermissions + full allow list
