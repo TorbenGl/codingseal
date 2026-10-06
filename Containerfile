@@ -39,7 +39,9 @@ RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Claude Code CLI (global, world-readable — usable by any user) ──────────
-RUN npm install -g @anthropic-ai/claude-code
+# Pass CLAUDE_CODE_VERSION (scripts/update.sh does) to bust the cached layer.
+ARG CLAUDE_CODE_VERSION=latest
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # ── Baked-in MCP servers (stdio) ───────────────────────────────────────────
 # Installed globally so `npx -y <pkg>` resolves them offline/instantly at

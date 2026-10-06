@@ -35,6 +35,11 @@ want_auth=0
 want_rc=0
 want_ssh=0
 
+# Session resume (local and --rc only). RESUME_ID is optional with --resume.
+want_continue=0
+want_resume=0
+RESUME_ID=""
+
 # ── Help ──────────────────────────────────────────────────────────────────
 usage() {
     cat <<'EOF'
@@ -58,6 +63,13 @@ Options:
                         Remote Control: run `claude remote-control` (detached, in the
                         background) so claude.ai/code and the Claude mobile app can
                         drive this environment; get the URL via `podman logs`
+  --continue            Resume the most recent session for this project. Local mode:
+                        `claude --continue`. With --rc: reattach to the last Remote
+                        Control session (only recorded for ~4 h; falls back to a
+                        fresh session if there is nothing to reattach to)
+  --resume [ID]         Resume a session by ID (local mode: without ID, shows
+                        claude's session picker). With --rc an ID is required and
+                        the reattach is strict (no fallback; ~4 h window applies)
   --ssh                 Headless: container stays running for SSH / VS Code Remote-SSH
   --port PORT           SSH port on localhost, used by --ssh (default: 2222)
   --name NAME           Container name (default: coding-seal)
@@ -86,6 +98,10 @@ Examples:
 
   # Remote Control — drive this container from claude.ai/code or the Claude app
   scripts/run.sh --rc -p ~/projects/myapp
+
+  # Pick up where you left off (local, or reattach a Remote Control session)
+  scripts/run.sh --continue -p ~/projects/myapp
+  scripts/run.sh --rc --continue -p ~/projects/myapp
 
   # Headless SSH / VS Code Remote-SSH
   scripts/run.sh --ssh -p ~/projects/myapp
@@ -165,6 +181,18 @@ while [[ $# -gt 0 ]]; do
         --ssh)
             want_ssh=1
             shift ;;
+        --continue)
+            want_continue=1
+            shift ;;
+        --resume)
+            want_resume=1
+            # ID is optional: only consume the next arg if it isn't another flag.
+            if [[ -n "${2:-}" && "$2" != -* ]]; then
+                RESUME_ID="$2"
+                shift 2
+            else
+                shift
+            fi ;;
         --port)
             SSH_PORT="$2"
             shift 2 ;;
@@ -218,6 +246,22 @@ fi
 (( want_auth )) && MODE="auth"
 (( want_rc ))   && MODE="remote-control"
 (( want_ssh ))  && MODE="ssh"
+
+# --continue/--resume need a claude session to resume: local and --rc only.
+if (( want_continue && want_resume )); then
+    echo "Error: --continue and --resume can't be combined (pick one)." >&2
+    exit 1
+fi
+if (( want_continue || want_resume )); then
+    case "${MODE}" in
+        ssh)  echo "Error: --continue/--resume don't apply to --ssh (this mode never invokes claude — run 'claude --continue' yourself after SSHing in)." >&2; exit 1 ;;
+        auth) echo "Error: --continue/--resume don't apply to --auth ('claude auth login' has no session to resume)." >&2; exit 1 ;;
+    esac
+    if [[ "${MODE}" == "remote-control" ]] && (( want_resume )) && [[ -z "${RESUME_ID}" ]]; then
+        echo "Error: --resume with --rc requires a session ID (e.g. --rc --resume <id>)." >&2
+        exit 1
+    fi
+fi
 
 # --model/--advisor only make sense where `claude` is actually invoked with a
 # session: local and --rc. --auth runs `claude auth login`, and --ssh never
@@ -375,6 +419,11 @@ if [[ "${MODE}" == "local" ]]; then
     CMD=("claude")
     [[ -n "${MODEL}" ]]   && CMD+=("--model" "${MODEL}")
     [[ -n "${ADVISOR}" ]] && CMD+=("--advisor" "${ADVISOR}")
+    (( want_continue )) && CMD+=("--continue")
+    if (( want_resume )); then
+        CMD+=("--resume")
+        [[ -n "${RESUME_ID}" ]] && CMD+=("${RESUME_ID}")
+    fi
 elif [[ "${MODE}" == "auth" ]]; then
     PODMAN_FLAGS+=("--tty" "--interactive")
     CMD=("claude" "auth" "login")
@@ -400,6 +449,22 @@ elif [[ "${MODE}" == "remote-control" ]]; then
     [[ -n "${MODEL}" ]]   && CMD+=("--model" "${MODEL}")
     [[ -n "${ADVISOR}" ]] && CMD+=("--advisor" "${ADVISOR}")
     CMD+=("remote-control" "--spawn" "same-dir" "--name" "${RC_NAME}")
+    if (( want_resume )); then
+        # Strict reattach by ID: no --spawn flags allowed with --session-id, and no
+        # fallback — a wrong/expired ID should fail loudly.
+        CMD=("${CMD[@]:0:${#CMD[@]}-4}" "--session-id" "${RESUME_ID}" "--name" "${RC_NAME}")
+    elif (( want_continue )); then
+        # Reattach to the last recorded session (no --spawn flags allowed with
+        # --continue). If nothing was recorded (exits non-zero), fall back to a
+        # fresh start inside the container, since it runs detached. The fallback
+        # gets its own "y" via heredoc in case the failed attempt ate the piped one.
+        FRESH_CMD="$(printf '%q ' "${CMD[@]}")"
+        CONT_CMD="$(printf '%q ' "${CMD[@]:0:${#CMD[@]}-4}" "--continue" "--name" "${RC_NAME}")"
+        CMD=("sh" "-c" "${CONT_CMD} || { echo 'run.sh: nothing to reattach (--continue failed) - starting a fresh Remote Control session instead' >&2; exec ${FRESH_CMD} <<'EOF'
+y
+EOF
+}")
+    fi
 else
     # MODE == "ssh": detached, container stays running; you SSH in (as coder,
     # with your own key) and start claude. sshd needs root, so override keep-id's
@@ -478,6 +543,7 @@ if [[ "${MODE}" == "remote-control" ]]; then
     # Pipe "y" to answer the one-time "Enable Remote Control?" prompt (see note
     # above `PODMAN_FLAGS+=("--detach" "--interactive")`) — without it the
     # container exits seconds after starting.
+    # (--continue's fallback to a fresh start happens inside the container command.)
     printf 'y\n' | podman run "${PODMAN_FLAGS[@]}" "${IMAGE}" "${CMD[@]}"
     echo ""
     echo "✅ '${CONTAINER_NAME}' is running in the background."

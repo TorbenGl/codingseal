@@ -432,6 +432,20 @@ Because nothing inbound is exposed, this works through NAT and firewalls with no
 
 > **Want both SSH *and* web control on one container?** They can't auto-start together (a container runs one command), but you don't need them to: start with **`--ssh`**, connect, and run **`claude remote-control`** yourself inside that session. You then have VS Code/SSH *and* the web/mobile session against the same container. (`scripts/run.sh --ssh --rc` is rejected with this same tip.)
 
+#### Resuming a session
+
+Containers are disposable, but conversations are stored in `~/.codingseal/claude-auth`, so you can pick one up again after a restart:
+
+```bash
+scripts/run.sh --continue -p ~/projects/myproject          # most recent conversation in this project
+scripts/run.sh --resume <id> -p ~/projects/myproject       # a specific one (bare --resume opens claude's picker)
+scripts/run.sh --rc --continue -p ~/projects/myproject     # reattach the last Remote Control session
+scripts/run.sh --rc --resume <id> -p ~/projects/myproject  # reattach a specific Remote Control session
+```
+
+With `--rc`, `claude` only remembers the last session for roughly **4 hours**. `--rc --continue` falls back to a fresh Remote Control session (and logs a line saying so) if there is nothing to reattach to; `--rc --resume <id>` fails instead, and the ID is required. `--continue`/`--resume` don't apply to `--ssh` or `--auth`. Inside a local session, `/resume` also works.
+
+
 ---
 
 ## 7. MCP Servers
@@ -561,6 +575,14 @@ Packages installed with `uv pip install` inside the container go into the contai
 **Full update** (base OS + Node.js + Claude Code + uv):
 ```bash
 podman build --pull=newer -t coding-seal:latest .
+```
+
+**Update Claude Code only** — rebuilds on the newest CLI from npm, bypassing the cached
+install layer, verifies `claude --version`, rolls back on failure and prunes the old image:
+```bash
+scripts/update.sh --check       # installed vs newest, changes nothing
+scripts/update.sh               # newest
+scripts/update.sh 2.1.289       # a specific version
 ```
 
 **Custom Python version:**
