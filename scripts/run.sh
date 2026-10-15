@@ -297,7 +297,7 @@ fi
 # podman's storage root — see CLAUDE_AUTH_DIR note above. We seed it from the
 # host because this dir is bind-mounted over /home/coder/.claude and would
 # otherwise shadow anything baked into the image:
-#   • settings.json — policy (bypassPermissions, allow list, theme/tui). Always
+#   • settings.json — policy (auto mode, allow list, theme/tui). Always
 #     refreshed from config/, so the suppression flags are guaranteed active.
 #   • .claude.json  — onboarding + trust state. The onboarding flag is seeded
 #     only if the file is absent, so a fresh dir never shows the theme picker.
@@ -390,7 +390,7 @@ PODMAN_FLAGS=(
     # Map your host user (uid 1000) to the container's `coder` user so bind-mounted
     # project files stay owned by you and the seeded config dir is writable. With
     # bare keep-id the container runs AS coder (uid 1000) — no root, so Claude's
-    # bypass-permissions mode runs with no prompt and no IS_SANDBOX trick. Only
+    # the user is non-root, so no root-guard issue and no IS_SANDBOX trick. Only
     # --ssh adds `--user 0` (below), because sshd needs root to start.
     "--userns=keep-id"
     # Persistent login + seeded config. :Z applies a private SELinux label

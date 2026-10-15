@@ -191,8 +191,8 @@ Together these mean Claude never stops to ask:
 |---|---|
 | Theme / color picker | `hasCompletedOnboarding: true` seeded in `.claude.json` |
 | "Do you trust the files in this folder?" | `projects["/"].hasTrustDialogAccepted: true` — trust inherits down to every mounted dir |
-| Bypass-permissions mode (no per-tool prompts) | `permissions.defaultMode: bypassPermissions` in settings.json |
-| "Yes, I accept bypass mode" warning | `skipDangerousModePermissionPrompt: true` in settings.json |
+| Per-tool permission prompts | `permissions.defaultMode: auto` in settings.json (classifier-gated auto mode) |
+| Auto-mode opt-in prompt | `skipAutoPermissionPrompt: true` in settings.json |
 | "Cannot skip permissions as root" | Claude runs as the **non-root `coder` user** — the guard only triggers for root, so the check never fires |
 | "Try the new fullscreen renderer?" | `tui: "default"` pinned in settings.json — any explicit `tui` value suppresses the upsell (use `"fullscreen"` if you prefer the flicker-free alt-screen UI) |
 | Re-login on every run | `CLAUDE_CONFIG_DIR` (= the persistent host auth folder) holds `.credentials.json` |
@@ -660,5 +660,5 @@ codingseal/
 │                                Section 3, "Container lifecycle"
 └── config/
     ├── sshd_config           ← Port 2222, key-only auth, static SetEnv CLAUDE_CONFIG_DIR, VS Code keepalive
-    └── claude-settings.json  ← bypassPermissions + full allow list (seeded into the auth folder by run.sh)
+    └── claude-settings.json  ← auto mode + full allow list (seeded into the auth folder by run.sh)
 ```
