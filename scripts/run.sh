@@ -11,6 +11,7 @@ SETTINGS_SRC="${REPO_DIR}/config/claude-settings.json"
 # ── Defaults ──────────────────────────────────────────────────────────────
 GPU_FLAGS=()
 PROJECT_MOUNTS=()
+PROJECT_PATHS=()       # abspaths from -p, pre-trusted in .claude.json (see trust-seeding block)
 MODEL=""                # --model VALUE, resolved; empty = claude's own default
 ADVISOR=""              # --advisor [VALUE], resolved; "opus" if passed bare
 MODE="local"            # "local"          → interactive TTY, `claude` starts immediately
@@ -33,6 +34,11 @@ SSH_PORT="${SSH_PORT:-2222}"
 want_auth=0
 want_rc=0
 want_ssh=0
+
+# Session resume (local and --rc only). RESUME_ID is optional with --resume.
+want_continue=0
+want_resume=0
+RESUME_ID=""
 
 # ── Help ──────────────────────────────────────────────────────────────────
 usage() {
@@ -57,6 +63,13 @@ Options:
                         Remote Control: run `claude remote-control` (detached, in the
                         background) so claude.ai/code and the Claude mobile app can
                         drive this environment; get the URL via `podman logs`
+  --continue            Resume the most recent session for this project. Local mode:
+                        `claude --continue`. With --rc: reattach to the last Remote
+                        Control session (only recorded for ~4 h; falls back to a
+                        fresh session if there is nothing to reattach to)
+  --resume [ID]         Resume a session by ID (local mode: without ID, shows
+                        claude's session picker). With --rc an ID is required and
+                        the reattach is strict (no fallback; ~4 h window applies)
   --ssh                 Headless: container stays running for SSH / VS Code Remote-SSH
   --port PORT           SSH port on localhost, used by --ssh (default: 2222)
   --name NAME           Container name (default: coding-seal)
@@ -85,6 +98,10 @@ Examples:
 
   # Remote Control — drive this container from claude.ai/code or the Claude app
   scripts/run.sh --rc -p ~/projects/myapp
+
+  # Pick up where you left off (local, or reattach a Remote Control session)
+  scripts/run.sh --continue -p ~/projects/myapp
+  scripts/run.sh --rc --continue -p ~/projects/myapp
 
   # Headless SSH / VS Code Remote-SSH
   scripts/run.sh --ssh -p ~/projects/myapp
@@ -151,6 +168,9 @@ while [[ $# -gt 0 ]]; do
             # Start Claude inside the FIRST project so it opens in your code,
             # not the empty /home/coder. Extra -p dirs stay accessible by path.
             [[ -z "${FIRST_PROJECT:-}" ]] && FIRST_PROJECT="${ABSPATH}"
+            # Trust is seeded per-path below (see the trust-seeding block) —
+            # keep every mounted path so each gets pre-trusted, not just the first.
+            PROJECT_PATHS+=("${ABSPATH}")
             shift 2 ;;
         --auth)
             want_auth=1
@@ -161,6 +181,18 @@ while [[ $# -gt 0 ]]; do
         --ssh)
             want_ssh=1
             shift ;;
+        --continue)
+            want_continue=1
+            shift ;;
+        --resume)
+            want_resume=1
+            # ID is optional: only consume the next arg if it isn't another flag.
+            if [[ -n "${2:-}" && "$2" != -* ]]; then
+                RESUME_ID="$2"
+                shift 2
+            else
+                shift
+            fi ;;
         --port)
             SSH_PORT="$2"
             shift 2 ;;
@@ -215,6 +247,22 @@ fi
 (( want_rc ))   && MODE="remote-control"
 (( want_ssh ))  && MODE="ssh"
 
+# --continue/--resume need a claude session to resume: local and --rc only.
+if (( want_continue && want_resume )); then
+    echo "Error: --continue and --resume can't be combined (pick one)." >&2
+    exit 1
+fi
+if (( want_continue || want_resume )); then
+    case "${MODE}" in
+        ssh)  echo "Error: --continue/--resume don't apply to --ssh (this mode never invokes claude — run 'claude --continue' yourself after SSHing in)." >&2; exit 1 ;;
+        auth) echo "Error: --continue/--resume don't apply to --auth ('claude auth login' has no session to resume)." >&2; exit 1 ;;
+    esac
+    if [[ "${MODE}" == "remote-control" ]] && (( want_resume )) && [[ -z "${RESUME_ID}" ]]; then
+        echo "Error: --resume with --rc requires a session ID (e.g. --rc --resume <id>)." >&2
+        exit 1
+    fi
+fi
+
 # --model/--advisor only make sense where `claude` is actually invoked with a
 # session: local and --rc. --auth runs `claude auth login`, and --ssh never
 # invokes claude at all (you run it yourself after SSHing in).
@@ -232,16 +280,35 @@ if [[ "${MODE}" == "ssh" && -z "${SSH_PUBLIC_KEY:-}" ]]; then
     exit 1
 fi
 
+# A container named ${CONTAINER_NAME} (running OR stopped) already occupies that
+# name — `podman run` would refuse to create a second one. Catch it here, before
+# the "Starting container..." banner below prints, so the failure reads as a
+# clear error instead of a silent crash under a success-looking summary.
+if podman container exists "${CONTAINER_NAME}" 2>/dev/null; then
+    STATE="$(podman inspect -f '{{.State.Status}}' "${CONTAINER_NAME}" 2>/dev/null || echo unknown)"
+    echo "Error: a container named '${CONTAINER_NAME}' already exists (status: ${STATE})." >&2
+    echo "  Stop/remove it:        podman rm -f ${CONTAINER_NAME}" >&2
+    echo "  ...or use another name: scripts/run.sh --name <other-name> ..." >&2
+    exit 1
+fi
+
 # ── Seed the persistent auth dir (host-side; no container entrypoint) ──────
 # A real host directory (not a named volume) so the location never depends on
 # podman's storage root — see CLAUDE_AUTH_DIR note above. We seed it from the
 # host because this dir is bind-mounted over /home/coder/.claude and would
 # otherwise shadow anything baked into the image:
-#   • settings.json — policy (bypassPermissions, allow list, theme/tui). Always
+#   • settings.json — policy (auto mode, allow list, theme/tui). Always
 #     refreshed from config/, so the suppression flags are guaranteed active.
-#   • .claude.json  — onboarding + trust state, seeded only if absent so a fresh
-#     dir never shows the theme picker or "trust this folder?" dialog. Claude
-#     maintains the file afterward (it never clears these flags).
+#   • .claude.json  — onboarding + trust state. The onboarding flag is seeded
+#     only if the file is absent, so a fresh dir never shows the theme picker.
+#     Trust ("/") is seeded the same way, but that only covers a literal "/"
+#     project — it does NOT pre-trust the actual -p directories, and Claude
+#     creates its own untrusted entry for each new directory it sees. Remote
+#     Control refuses to interactively prompt for trust, so an untrusted -p
+#     dir makes it exit immediately with "Workspace not trusted". The merge
+#     step below (which also registers MCP servers) fixes this by force-
+#     trusting every -p path on EVERY run, not just when the file is first
+#     created.
 mkdir -p "${CLAUDE_AUTH_DIR}"
 [[ -f "${SETTINGS_SRC}" ]] || { echo "Error: missing ${SETTINGS_SRC}" >&2; exit 1; }
 cp "${SETTINGS_SRC}" "${CLAUDE_AUTH_DIR}/settings.json"
@@ -250,22 +317,27 @@ if [[ ! -f "${CLAUDE_AUTH_DIR}/.claude.json" ]]; then
         > "${CLAUDE_AUTH_DIR}/.claude.json"
 fi
 
-# ── Register the built-in MCP servers (user scope) ─────────────────────────
-# Merge into the seeded .claude.json's top-level `mcpServers` (user scope) so
-# they load in every project and every mode (local / --rc / manual claude over
-# --ssh) with no approval prompt. Idempotent: existing keys are preserved.
-#   context7            — up-to-date library docs (stdio, baked in the image)
-#   sequential-thinking — reasoning scaffold (stdio, baked in the image)
-#   github              — remote endpoint, added ONLY when a PAT is provided
+# ── Register MCP servers + pre-trust project paths (user scope) ────────────
+# Merge into the seeded .claude.json:
+#   • `mcpServers` (top-level, user scope) so they load in every project and
+#     every mode (local / --rc / manual claude over --ssh) with no approval
+#     prompt. Idempotent: existing keys are preserved.
+#       context7            — up-to-date library docs (stdio, baked in image)
+#       sequential-thinking — reasoning scaffold (stdio, baked in image)
+#       github              — remote endpoint, added ONLY when a PAT is given
+#   • `projects.<abspath>.hasTrustDialogAccepted` for every -p path, forced to
+#     true on every run (see note above `mkdir -p "${CLAUDE_AUTH_DIR}"`) so
+#     Remote Control never refuses a mounted project as untrusted.
 # Optional credentials come from the environment (i.e. your .env):
 #   CONTEXT7_API_KEY                higher Context7 rate limits (works without it)
 #   GITHUB_PERSONAL_ACCESS_TOKEN    enables the GitHub MCP server (Bearer header)
 if command -v python3 >/dev/null 2>&1; then
     CONTEXT7_API_KEY="${CONTEXT7_API_KEY:-}" \
     GITHUB_PERSONAL_ACCESS_TOKEN="${GITHUB_PERSONAL_ACCESS_TOKEN:-}" \
-    python3 - "${CLAUDE_AUTH_DIR}/.claude.json" <<'PY'
+    python3 - "${CLAUDE_AUTH_DIR}/.claude.json" "${PROJECT_PATHS[@]}" <<'PY'
 import json, os, sys
 path = sys.argv[1]
+project_paths = sys.argv[2:]
 ctx_key = os.environ.get("CONTEXT7_API_KEY", "").strip()
 gh_pat  = os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip()
 
@@ -276,6 +348,10 @@ if os.path.exists(path):
             data = json.load(f)
     except Exception:
         data = {}
+
+projects = data.setdefault("projects", {})
+for p in project_paths:
+    projects.setdefault(p, {}).update({"hasTrustDialogAccepted": True})
 
 servers = data.setdefault("mcpServers", {})
 
@@ -314,7 +390,7 @@ PODMAN_FLAGS=(
     # Map your host user (uid 1000) to the container's `coder` user so bind-mounted
     # project files stay owned by you and the seeded config dir is writable. With
     # bare keep-id the container runs AS coder (uid 1000) — no root, so Claude's
-    # bypass-permissions mode runs with no prompt and no IS_SANDBOX trick. Only
+    # the user is non-root, so no root-guard issue and no IS_SANDBOX trick. Only
     # --ssh adds `--user 0` (below), because sshd needs root to start.
     "--userns=keep-id"
     # Persistent login + seeded config. :Z applies a private SELinux label
@@ -343,6 +419,11 @@ if [[ "${MODE}" == "local" ]]; then
     CMD=("claude")
     [[ -n "${MODEL}" ]]   && CMD+=("--model" "${MODEL}")
     [[ -n "${ADVISOR}" ]] && CMD+=("--advisor" "${ADVISOR}")
+    (( want_continue )) && CMD+=("--continue")
+    if (( want_resume )); then
+        CMD+=("--resume")
+        [[ -n "${RESUME_ID}" ]] && CMD+=("${RESUME_ID}")
+    fi
 elif [[ "${MODE}" == "auth" ]]; then
     PODMAN_FLAGS+=("--tty" "--interactive")
     CMD=("claude" "auth" "login")
@@ -352,17 +433,38 @@ elif [[ "${MODE}" == "remote-control" ]]; then
     # and polls for work — so there's NO inbound port and no --publish.
     #
     # Run DETACHED with no TTY: `claude remote-control` is a server ("no local
-    # interactive session"), and the start prompts ("really start?" / "same dir?")
-    # only appear when it's attached to a TTY. Headless + `--spawn same-dir` makes
-    # it start straight away with no prompts. The session URL goes to the logs
-    # (podman logs) and the session is listed by --name at claude.ai/code.
+    # interactive session"). `--spawn same-dir` skips the "same dir?" prompt, but
+    # NOT the one-time "Enable Remote Control? (y/n)" confirmation — that one
+    # still reads from stdin. Without `--interactive`, stdin is closed, so that
+    # read hits EOF immediately and the process exits right after printing the
+    # banner (container shows "Exited (0)" seconds after start). We keep
+    # `--interactive` (no `--tty`) and feed a piped "y" answer below so the
+    # prompt is satisfied non-interactively and the server keeps running.
+    # The session URL goes to the logs (podman logs) and the session is listed
+    # by --name at claude.ai/code.
     RC_NAME="${CONTAINER_NAME}"
     [[ -n "${FIRST_PROJECT:-}" ]] && RC_NAME="$(basename -- "${FIRST_PROJECT}")"
-    PODMAN_FLAGS+=("--detach")
+    PODMAN_FLAGS+=("--detach" "--interactive")
     CMD=("claude")
     [[ -n "${MODEL}" ]]   && CMD+=("--model" "${MODEL}")
     [[ -n "${ADVISOR}" ]] && CMD+=("--advisor" "${ADVISOR}")
     CMD+=("remote-control" "--spawn" "same-dir" "--name" "${RC_NAME}")
+    if (( want_resume )); then
+        # Strict reattach by ID: no --spawn flags allowed with --session-id, and no
+        # fallback — a wrong/expired ID should fail loudly.
+        CMD=("${CMD[@]:0:${#CMD[@]}-4}" "--session-id" "${RESUME_ID}" "--name" "${RC_NAME}")
+    elif (( want_continue )); then
+        # Reattach to the last recorded session (no --spawn flags allowed with
+        # --continue). If nothing was recorded (exits non-zero), fall back to a
+        # fresh start inside the container, since it runs detached. The fallback
+        # gets its own "y" via heredoc in case the failed attempt ate the piped one.
+        FRESH_CMD="$(printf '%q ' "${CMD[@]}")"
+        CONT_CMD="$(printf '%q ' "${CMD[@]:0:${#CMD[@]}-4}" "--continue" "--name" "${RC_NAME}")"
+        CMD=("sh" "-c" "${CONT_CMD} || { echo 'run.sh: nothing to reattach (--continue failed) - starting a fresh Remote Control session instead' >&2; exec ${FRESH_CMD} <<'EOF'
+y
+EOF
+}")
+    fi
 else
     # MODE == "ssh": detached, container stays running; you SSH in (as coder,
     # with your own key) and start claude. sshd needs root, so override keep-id's
@@ -438,7 +540,11 @@ fi
 if [[ "${MODE}" == "remote-control" ]]; then
     # Detached: podman prints the container ID and returns. Tell the user how to
     # reach the session (the URL is in the logs once Claude connects).
-    podman run "${PODMAN_FLAGS[@]}" "${IMAGE}" "${CMD[@]}"
+    # Pipe "y" to answer the one-time "Enable Remote Control?" prompt (see note
+    # above `PODMAN_FLAGS+=("--detach" "--interactive")`) — without it the
+    # container exits seconds after starting.
+    # (--continue's fallback to a fresh start happens inside the container command.)
+    printf 'y\n' | podman run "${PODMAN_FLAGS[@]}" "${IMAGE}" "${CMD[@]}"
     echo ""
     echo "✅ '${CONTAINER_NAME}' is running in the background."
     echo "   Session URL / status:  podman logs -f ${CONTAINER_NAME}"

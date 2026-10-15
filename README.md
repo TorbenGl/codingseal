@@ -191,8 +191,8 @@ Together these mean Claude never stops to ask:
 |---|---|
 | Theme / color picker | `hasCompletedOnboarding: true` seeded in `.claude.json` |
 | "Do you trust the files in this folder?" | `projects["/"].hasTrustDialogAccepted: true` — trust inherits down to every mounted dir |
-| Bypass-permissions mode (no per-tool prompts) | `permissions.defaultMode: bypassPermissions` in settings.json |
-| "Yes, I accept bypass mode" warning | `skipDangerousModePermissionPrompt: true` in settings.json |
+| Per-tool permission prompts | `permissions.defaultMode: auto` in settings.json (classifier-gated auto mode) |
+| Auto-mode opt-in prompt | `skipAutoPermissionPrompt: true` in settings.json |
 | "Cannot skip permissions as root" | Claude runs as the **non-root `coder` user** — the guard only triggers for root, so the check never fires |
 | "Try the new fullscreen renderer?" | `tui: "default"` pinned in settings.json — any explicit `tui` value suppresses the upsell (use `"fullscreen"` if you prefer the flicker-free alt-screen UI) |
 | Re-login on every run | `CLAUDE_CONFIG_DIR` (= the persistent host auth folder) holds `.credentials.json` |
@@ -432,6 +432,20 @@ Because nothing inbound is exposed, this works through NAT and firewalls with no
 
 > **Want both SSH *and* web control on one container?** They can't auto-start together (a container runs one command), but you don't need them to: start with **`--ssh`**, connect, and run **`claude remote-control`** yourself inside that session. You then have VS Code/SSH *and* the web/mobile session against the same container. (`scripts/run.sh --ssh --rc` is rejected with this same tip.)
 
+#### Resuming a session
+
+Containers are disposable, but conversations are stored in `~/.codingseal/claude-auth`, so you can pick one up again after a restart:
+
+```bash
+scripts/run.sh --continue -p ~/projects/myproject          # most recent conversation in this project
+scripts/run.sh --resume <id> -p ~/projects/myproject       # a specific one (bare --resume opens claude's picker)
+scripts/run.sh --rc --continue -p ~/projects/myproject     # reattach the last Remote Control session
+scripts/run.sh --rc --resume <id> -p ~/projects/myproject  # reattach a specific Remote Control session
+```
+
+With `--rc`, `claude` only remembers the last session for roughly **4 hours**. `--rc --continue` falls back to a fresh Remote Control session (and logs a line saying so) if there is nothing to reattach to; `--rc --resume <id>` fails instead, and the ID is required. `--continue`/`--resume` don't apply to `--ssh` or `--auth`. Inside a local session, `/resume` also works.
+
+
 ---
 
 ## 7. MCP Servers
@@ -563,6 +577,14 @@ Packages installed with `uv pip install` inside the container go into the contai
 podman build --pull=newer -t coding-seal:latest .
 ```
 
+**Update Claude Code only** — rebuilds on the newest CLI from npm, bypassing the cached
+install layer, verifies `claude --version`, rolls back on failure and prunes the old image:
+```bash
+scripts/update.sh --check       # installed vs newest, changes nothing
+scripts/update.sh               # newest
+scripts/update.sh 2.1.289       # a specific version
+```
+
 **Custom Python version:**
 ```bash
 podman build --build-arg PYTHON_VERSION=3.11 -t coding-seal:py311 .
@@ -638,5 +660,5 @@ codingseal/
 │                                Section 3, "Container lifecycle"
 └── config/
     ├── sshd_config           ← Port 2222, key-only auth, static SetEnv CLAUDE_CONFIG_DIR, VS Code keepalive
-    └── claude-settings.json  ← bypassPermissions + full allow list (seeded into the auth folder by run.sh)
+    └── claude-settings.json  ← auto mode + full allow list (seeded into the auth folder by run.sh)
 ```
